@@ -1,0 +1,9 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-2.0-only
+"""Installed nonprivileged hwmon-only command; no user/project imports."""
+import sys
+
+sys.path.insert(0, "/usr/local/lib/ax860i-sensors")
+from ax860i.native_readout import main
+
+raise SystemExit(main())

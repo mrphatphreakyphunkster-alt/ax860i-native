@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Bind only Corsair AX860i USB interfaces to native hwmon
+After=systemd-udev-trigger.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/ax860i-native-bind
+RuntimeDirectory=ax860i-native
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+# Each operation has a helper deadline. Do not kill a rollback halfway through.
+TimeoutStartSec=0
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

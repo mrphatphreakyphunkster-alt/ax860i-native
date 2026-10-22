@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Bind Corsair AX860i on USB arrival (serialized enumeration)
+After=systemd-udev-trigger.service
+
+[Service]
+Type=oneshot
+# No instance expansion or user-supplied sysfs path reaches the root helper.
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/ax860i-native-bind
+RuntimeDirectory=ax860i-native
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+TimeoutStartSec=0
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+PrivateTmp=yes

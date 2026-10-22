@@ -1,0 +1,164 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Root-owned, fixed-scope AX860i binder. No CLI path or environment overrides."""
+import fcntl
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+
+NATIVE = "ax860i_native"
+
+
+class BindError(RuntimeError):
+    pass
+
+
+class Binder:
+    # Dependency injection is for offline tests only; main() accepts no arguments.
+    def __init__(self, sysroot=Path("/sys"), devroot=Path("/dev"),
+                 run=subprocess.run, sleep=time.sleep, clock=time.monotonic):
+        self.sysroot, self.devroot = Path(sysroot), Path(devroot)
+        self.run, self.sleep, self.clock = run, sleep, clock
+        self.devices = self.sysroot / "bus/usb/devices"
+        self.drivers = self.sysroot / "bus/usb/drivers"
+
+    def identity(self, interface):
+        try:
+            path = interface.resolve(strict=True)
+            if not path.is_relative_to((self.sysroot / "devices").resolve()):
+                return False
+            if not re.fullmatch(r"[0-9]+-[0-9]+(?:\.[0-9]+)*:1\.0", interface.name):
+                return False
+            fields = {"bInterfaceNumber": "00", "bAlternateSetting": "0",
+                      "bInterfaceClass": "ff", "bInterfaceSubClass": "00",
+                      "bInterfaceProtocol": "00"}
+            return (all((path / key).read_text().strip() == value
+                        for key, value in fields.items())
+                    and (path.parent / "idVendor").read_text().strip() == "1b1c"
+                    and (path.parent / "idProduct").read_text().strip() == "1c00")
+        except (OSError, UnicodeError):
+            return False
+
+    def owner(self, interface):
+        link = interface / "driver"
+        if not link.is_symlink():
+            return None
+        target = link.resolve(strict=True)
+        if target.parent != self.drivers.resolve():
+            raise BindError("driver link outside USB driver directory")
+        return target.name
+
+    def command(self, argv):
+        return self.run(argv, check=True, timeout=20, capture_output=True, text=True)
+
+    def write(self, interface, driver, operation):
+        if not self.identity(interface):
+            raise BindError("identity changed/disconnected; no sysfs write")
+        owner = self.owner(interface)
+        expected = driver if operation == "unbind" else None
+        if owner != expected:
+            raise BindError(f"ownership changed to {owner!r}; refusing {operation}")
+        (self.drivers / driver / operation).write_text(interface.name, encoding="ascii")
+
+    def require_idle(self, interface):
+        ttys = sorted(interface.glob("ttyUSB*/tty/ttyUSB*"))
+        ttys += sorted(interface.glob("tty/ttyUSB*"))
+        if not ttys:
+            raise BindError("cp210x TTY not present yet; retry explicitly, no unbind")
+        for tty in ttys:
+            if not re.fullmatch(r"ttyUSB[0-9]+", tty.name):
+                raise BindError("unexpected TTY name")
+            result = self.run(["/usr/bin/fuser", "--", str(self.devroot / tty.name)],
+                              check=False, timeout=5, capture_output=True, text=True)
+            # fuser uses 1 for no users; missing/inaccessible nodes are not evidence of idle.
+            if (not (self.devroot / tty.name).exists() or result.returncode != 1
+                    or result.stderr.strip()):
+                raise BindError(f"TTY busy or idle check failed: {tty.name}")
+
+    def healthy(self, interface):
+        if not self.identity(interface) or self.owner(interface) != NATIVE:
+            return False
+        for hwmon in interface.glob("hwmon/hwmon*"):
+            try:
+                if (hwmon / "name").read_text().strip() != NATIVE:
+                    continue
+                # A published complete snapshot, not just driver symlink/probe success.
+                for name in ("power1_input", "power5_input", "in0_input"):
+                    if not re.fullmatch(r"[0-9]+", (hwmon / name).read_text().strip()):
+                        return False
+                return True
+            except OSError:
+                continue
+        return False
+
+    def attach(self, interface):
+        if not self.identity(interface):
+            return "ignored"
+        original = self.owner(interface)
+        if original == NATIVE:
+            return "already native (no rebind)"
+        if original not in (None, "cp210x"):
+            return f"untouched unexpected driver {original}"
+        if original == "cp210x":
+            self.require_idle(interface)
+        # Loading can bind an unclaimed exact-match device. Track that case too.
+        try:
+            self.command(["/usr/sbin/modprobe", NATIVE])
+            owner = self.owner(interface)
+            if owner == "cp210x":
+                self.require_idle(interface)
+                self.write(interface, "cp210x", "unbind")
+                owner = self.owner(interface)
+            if owner is None:
+                self.write(interface, NATIVE, "bind")
+            elif owner != NATIVE:
+                raise BindError("unexpected owner after module load")
+            deadline = self.clock() + 45
+            while self.clock() < deadline:
+                if self.healthy(interface):
+                    return "native snapshot ready"
+                if not self.identity(interface) or self.owner(interface) != NATIVE:
+                    break
+                self.sleep(0.25)
+            raise BindError("native probe/snapshot failed or timed out")
+        except (OSError, BindError, subprocess.SubprocessError) as exc:
+            # Never displace a third-party owner during recovery.
+            try:
+                if self.identity(interface):
+                    if self.owner(interface) == NATIVE:
+                        self.write(interface, NATIVE, "unbind")
+                    if self.owner(interface) is None and original == "cp210x":
+                        self.write(interface, "cp210x", "bind")
+                    if self.owner(interface) != original:
+                        raise BindError("original ownership not restored")
+            except (OSError, BindError) as rollback:
+                raise BindError(f"{exc}; ROLLBACK FAILED: {rollback}") from exc
+            raise BindError(f"{exc}; original ownership restored or device disconnected") from exc
+
+    def bind_all(self):
+        failed = False
+        for interface in sorted(self.devices.glob("*:1.0")):
+            try:
+                print(f"{interface.name}: {self.attach(interface)}", flush=True)
+            except (OSError, BindError, subprocess.SubprocessError) as exc:
+                failed = True
+                print(f"{interface.name}: {exc}", file=sys.stderr, flush=True)
+        return 1 if failed else 0
+
+
+def main():
+    if len(sys.argv) != 1 or os.geteuid() != 0:
+        raise SystemExit("root only; this helper accepts no arguments")
+    # RuntimeDirectory created by systemd, root-only; serialize boot/hotplug runs.
+    fd = os.open("/run/ax860i-native/bind.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return Binder().bind_all()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

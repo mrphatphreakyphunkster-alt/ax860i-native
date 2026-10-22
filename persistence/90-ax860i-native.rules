@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Parent attributes must match the same USB device; interface attribute is local.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTR{bInterfaceNumber}=="00", ATTRS{idVendor}=="1b1c", ATTRS{idProduct}=="1c00", TAG+="systemd", ENV{SYSTEMD_WANTS}+="ax860i-native-bind@.service"
